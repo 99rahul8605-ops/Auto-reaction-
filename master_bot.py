@@ -4,8 +4,8 @@ import logging
 import random
 from aiohttp import web
 from telethon import TelegramClient, events, Button
-from telethon.tl.functions.messages import SendReactionRequest, SendMessageRequest
-from telethon.tl.types import ReactionEmoji, Channel, Chat
+from telethon.tl.functions.messages import SendReactionRequest
+from telethon.tl.types import ReactionEmoji, Channel, Chat, User
 from motor.motor_asyncio import AsyncIOMotorClient
 
 logging.basicConfig(
@@ -22,32 +22,12 @@ MASTER_USERNAME = os.environ.get("MASTER_BOT_USERNAME", "")
 MONGO_URI       = os.environ["MONGO_URI"]
 PORT            = int(os.environ.get("PORT", 8080))
 
+# ─── OWNER ID — sirf ye use kar sakta hai ────────────────────────
+# Apna Telegram user ID yahan daalo (integer)
+# Pata karne ke liye @userinfobot pe /start bhejo
+OWNER_ID = int(os.environ["OWNER_ID"])
+
 REACTIONS = ["👍", "❤", "🔥", "🎉", "😍", "👏", "🤩", "💯", "😂", "🥰"]
-
-# ─── Message Effects (Telegram effect_id list) ───────────────────
-# Ye wahi effects hain jo hold karke bhejte hain
-EFFECTS = [
-    5104841245755180586,   # 🔥 Fire
-    5046509860389126442,   # 👍 Thumbs up
-    5107584321108051014,   # 🎉 Party / Confetti
-    5044134455711629726,   # ❤ Heart
-    5027712690068940800,   # 💩 Poop (funny)
-    5083162785249204200,   # 🎊 Balloons
-]
-
-# Reaction → matching effect (jab ho sake toh matching bhejo)
-REACTION_EFFECT_MAP = {
-    "👍": 5046509860389126442,
-    "❤":  5044134455711629726,
-    "🔥": 5104841245755180586,
-    "🎉": 5107584321108051014,
-    "😂": 5027712690068940800,
-    "🥰": 5044134455711629726,
-    "👏": 5046509860389126442,
-    "🤩": 5107584321108051014,
-    "💯": 5083162785249204200,
-    "😍": 5044134455711629726,
-}
 
 # ─── MongoDB ─────────────────────────────────────────────────────
 mongo_client = AsyncIOMotorClient(MONGO_URI)
@@ -56,46 +36,41 @@ bots_col     = db["bots"]
 workers: dict[str, TelegramClient] = {}
 
 
-# ─── Core reaction + effect logic ────────────────────────────────
+# ─── Owner check decorator ────────────────────────────────────────
+def owner_only(func):
+    async def wrapper(event, *args, **kwargs):
+        if event.sender_id != OWNER_ID:
+            await event.respond("🚫 **Ye bot sirf owner ke liye hai!**")
+            logger.warning(f"Unauthorized access attempt by user_id={event.sender_id}")
+            return
+        return await func(event, *args, **kwargs)
+    return wrapper
+
+
+# ─── Core reaction logic ──────────────────────────────────────────
 async def do_react(worker_client, event, name):
     try:
-        # Commands skip
         if event.message.text and event.message.text.startswith("/"):
             return
 
         chat = await event.get_chat()
 
-        # FIX: Ab private chat (User) bhi allowed — sirf bots skip karo
-        from telethon.tl.types import User
         is_megagroup   = isinstance(chat, Channel) and getattr(chat, "megagroup", False)
         is_broadcast   = isinstance(chat, Channel) and getattr(chat, "broadcast", False)
         is_small_group = isinstance(chat, Chat)
         is_private     = isinstance(chat, User) and not getattr(chat, "bot", False)
 
         if not (is_megagroup or is_broadcast or is_small_group or is_private):
-            return  # Sirf bots ke DM skip
+            return
 
         emoji = random.choice(REACTIONS)
 
-        # Step 1: Reaction do
         await worker_client(SendReactionRequest(
             peer=event.chat_id,
             msg_id=event.message.id,
             reaction=[ReactionEmoji(emoticon=emoji)],
         ))
         logger.info(f"[{name}] ✅ Reacted {emoji} | chat={event.chat_id}")
-
-        # Step 2: Effect ke saath reply karo (matching effect if available)
-        effect_id = REACTION_EFFECT_MAP.get(emoji, random.choice(EFFECTS))
-
-        await worker_client(SendMessageRequest(
-            peer=event.chat_id,
-            message=emoji,
-            effect=effect_id,
-            reply_to_msg_id=event.message.id,
-            no_webpage=True,
-        ))
-        logger.info(f"[{name}] ✨ Sent effect reply | effect={effect_id}")
 
     except Exception as e:
         logger.error(f"[{name}] ❌ Failed: {e}")
@@ -129,17 +104,19 @@ async def start_worker(token: str, username: str, name: str):
             f"2️⃣ Admin banao\n"
             f"3️⃣ Ho gaya! 🎉"
         )
-        buttons = None
+        buttons = []
         if username:
-            buttons = [[
+            buttons.append([
                 Button.url("➕ Add to Group",   f"https://t.me/{username}?startgroup=true"),
                 Button.url("📢 Add to Channel", f"https://t.me/{username}?startchannel=true"),
-            ]]
+            ])
+        buttons.append([
+            Button.url("📣 Support Channel", "https://t.me/Bot_support_channell"),
+        ])
         await event.respond(text, buttons=buttons)
 
     @worker_client.on(events.NewMessage())
     async def auto_react(event):
-        # Apna hi message ignore karo
         if event.out:
             return
         asyncio.create_task(do_react(worker_client, event, name))
@@ -165,18 +142,14 @@ async def stop_worker(token: str):
 # ─── Master Bot ──────────────────────────────────────────────────
 master = TelegramClient("sessions/master", API_ID, API_HASH)
 
-waiting_for_token: set[int] = set()
+waiting_for_token: bool = False
 
 
 async def show_my_bots(event, edit=False):
-    sender_id  = event.sender_id
-    sender     = await event.get_sender()
-    first_name = getattr(sender, "first_name", "there") or "there"
-
-    user_bots = await bots_col.find({"owner_id": sender_id}).to_list(length=50)
+    user_bots = await bots_col.find({"owner_id": OWNER_ID}).to_list(length=50)
 
     if user_bots:
-        lines = [f"👋 **Hey {first_name}!**\n\n📋 **Tumhare registered bots ({len(user_bots)}):**\n"]
+        lines = [f"📋 **Registered Bots ({len(user_bots)}):**\n"]
         for i, doc in enumerate(user_bots, 1):
             status = "🟢" if doc["token"] in workers else "🔴"
             lines.append(f"{i}. {status} **{doc['name']}** (@{doc['username'] or 'N/A'})")
@@ -193,18 +166,18 @@ async def show_my_bots(event, edit=False):
         buttons = bot_buttons
     else:
         text = (
-            f"👋 **Hey {first_name}! Welcome!**\n\n"
-            f"🚀 **Reaction Bot SaaS**\n\n"
-            f"Apna bot register karo aur wo automatically har\n"
-            f"group/channel/DM message pe react karega!\n\n"
+            f"👋 **Welcome Owner!**\n\n"
+            f"🚀 Koi bot registered nahi hai abhi.\n\n"
             f"📌 **Kaise kaam karta hai:**\n"
             f"1️⃣ @BotFather se apna bot banao\n"
             f"2️⃣ Bot token yahan submit karo\n"
             f"3️⃣ Apne bot ko group/channel me add karo\n"
-            f"4️⃣ Admin banao — bas! 🎉\n\n"
-            f"⬇️ Shuru karo:"
+            f"4️⃣ Admin banao — bas! 🎉"
         )
-        buttons = [[Button.inline("➕ Apna Bot Register Karo", data="register")]]
+        buttons = [
+            [Button.inline("➕ Bot Register Karo", data="register")],
+            [Button.url("📣 Support Channel", "https://t.me/Bot_support_channell")],
+        ]
 
     if edit:
         await event.edit(text, buttons=buttons)
@@ -213,15 +186,26 @@ async def show_my_bots(event, edit=False):
 
 
 @master.on(events.NewMessage(pattern=r"^/start$"))
+@owner_only
 async def master_start(event):
+    await show_my_bots(event)
+
+
+@master.on(events.NewMessage(pattern=r"^/mybots$"))
+@owner_only
+async def my_bots_cmd(event):
     await show_my_bots(event)
 
 
 @master.on(events.CallbackQuery(data="register"))
 async def ask_for_token(event):
-    waiting_for_token.add(event.sender_id)
+    if event.sender_id != OWNER_ID:
+        await event.answer("🚫 Unauthorized!", alert=True)
+        return
+    global waiting_for_token
+    waiting_for_token = True
     await event.respond(
-        "🔑 **Apna BotFather token paste karo:**\n\n"
+        "🔑 **BotFather token paste karo:**\n\n"
         "Token aisa dikhta hai:\n`123456789:AAFxxxxxxxxxxxxxxxxxxxxxxxxx`\n\n"
         "❌ Cancel karna ho to /cancel bhejo"
     )
@@ -229,20 +213,26 @@ async def ask_for_token(event):
 
 
 @master.on(events.NewMessage(pattern=r"^/cancel$"))
+@owner_only
 async def cancel_registration(event):
-    waiting_for_token.discard(event.sender_id)
+    global waiting_for_token
+    waiting_for_token = False
     await event.respond("❌ Registration cancel ho gaya.")
 
 
 @master.on(events.NewMessage())
 async def handle_token_input(event):
-    if event.sender_id not in waiting_for_token:
+    global waiting_for_token
+    if event.sender_id != OWNER_ID:
+        await event.respond("🚫 **Ye bot sirf owner ke liye hai!**")
+        return
+    if not waiting_for_token:
         return
     if not event.message.text or event.message.text.startswith("/"):
         return
 
     token = event.message.text.strip()
-    waiting_for_token.discard(event.sender_id)
+    waiting_for_token = False
 
     if ":" not in token or len(token) < 30:
         await event.respond("❌ Token format galat hai. Dobara try karo /start se.")
@@ -267,7 +257,7 @@ async def handle_token_input(event):
         return
 
     await bots_col.insert_one({
-        "owner_id": event.sender_id,
+        "owner_id": OWNER_ID,
         "token":    token,
         "username": bot_username,
         "name":     bot_name,
@@ -280,8 +270,7 @@ async def handle_token_input(event):
         f"✅ **Bot successfully registered!**\n\n"
         f"🤖 **{bot_name}** (@{bot_username})\n\n"
         f"Ab apne bot ko group/channel me add karo aur admin banao!\n\n"
-        f"Bot automatically react karna shuru kar dega 🎉\n\n"
-        f"💡 Aur bots add karne ke liye /start karo.",
+        f"Bot automatically react karna shuru kar dega 🎉",
         buttons=[[
             Button.url(f"➕ @{bot_username} ko Add Karo", f"https://t.me/{bot_username}?startgroup=true"),
         ]] if bot_username else None
@@ -290,26 +279,24 @@ async def handle_token_input(event):
 
 @master.on(events.CallbackQuery(pattern=rb"^remove_(.+)$"))
 async def remove_bot(event):
-    token_prefix = event.data.decode().split("_", 1)[1]
+    if event.sender_id != OWNER_ID:
+        await event.answer("🚫 Unauthorized!", alert=True)
+        return
 
+    token_prefix = event.data.decode().split("_", 1)[1]
     doc = await bots_col.find_one({
         "token":    {"$regex": f"^{token_prefix}"},
-        "owner_id": event.sender_id,
+        "owner_id": OWNER_ID,
     })
 
     if not doc:
-        await event.answer("❌ Bot nahi mila ya ye tumhara nahi hai!", alert=True)
+        await event.answer("❌ Bot nahi mila!", alert=True)
         return
 
     await stop_worker(doc["token"])
     await bots_col.delete_one({"_id": doc["_id"]})
     await event.answer(f"🗑 @{doc['username']} remove ho gaya!", alert=True)
     await show_my_bots(event, edit=True)
-
-
-@master.on(events.NewMessage(pattern=r"^/mybots$"))
-async def my_bots_cmd(event):
-    await show_my_bots(event)
 
 
 # ─── Health Server ───────────────────────────────────────────────
@@ -343,7 +330,7 @@ async def main():
 
     await master.start(bot_token=MASTER_TOKEN)
     me = await master.get_me()
-    logger.info(f"🤖 Master bot started: @{me.username}")
+    logger.info(f"🤖 Master bot started: @{me.username} | Owner: {OWNER_ID}")
 
     await master.run_until_disconnected()
 
