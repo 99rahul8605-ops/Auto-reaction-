@@ -27,7 +27,7 @@ PORT            = int(os.environ.get("PORT", 8080))
 # Pata karne ke liye @userinfobot pe /start bhejo
 OWNER_ID = int(os.environ["OWNER_ID"])
 
-REACTIONS = ["👍", "❤", "🔥", "🎉", "😍", "👏", "🤩", "💯", "😂", "🥰"]
+REACTIONS = ["👍", "👎", "❤", "🔥", "🥰", "👏", "😁", "🤔", "🤯", "😱", "🤬", "😢", "🎉", "🤩", "🤮", "💩", "🙏", "👌", "🕊", "🤡", "🥱", "🥴", "😍", "🐳", "❤‍🔥", "🌚", "🌭", "💯", "🤣", "⚡", "🍌", "🏆", "💔", "🤨", "😐", "🍓", "🍾", "💋", "🖕", "😈", "😴", "😭", "🤓", "👻", "👨‍💻", "👀", "🎃", "🙈", "😇", "😂"]
 
 # ─── MongoDB ─────────────────────────────────────────────────────
 mongo_client = AsyncIOMotorClient(MONGO_URI)
@@ -48,6 +48,9 @@ def owner_only(func):
 
 
 # ─── Core reaction logic ──────────────────────────────────────────
+# Ye 100% safe reactions hain — fallback ke liye
+SAFE_REACTIONS = ["👍", "❤", "🔥", "🎉", "😂"]
+
 async def do_react(worker_client, event, name):
     try:
         if event.message.text and event.message.text.startswith("/"):
@@ -65,12 +68,26 @@ async def do_react(worker_client, event, name):
 
         emoji = random.choice(REACTIONS)
 
-        await worker_client(SendReactionRequest(
-            peer=event.chat_id,
-            msg_id=event.message.id,
-            reaction=[ReactionEmoji(emoticon=emoji)],
-        ))
-        logger.info(f"[{name}] ✅ Reacted {emoji} | chat={event.chat_id}")
+        try:
+            await worker_client(SendReactionRequest(
+                peer=event.chat_id,
+                msg_id=event.message.id,
+                reaction=[ReactionEmoji(emoticon=emoji)],
+            ))
+            logger.info(f"[{name}] ✅ Reacted {emoji} | chat={event.chat_id}")
+
+        except Exception as reaction_err:
+            if "Invalid reaction" in str(reaction_err):
+                # Fallback — safe emoji se try karo
+                safe_emoji = random.choice(SAFE_REACTIONS)
+                await worker_client(SendReactionRequest(
+                    peer=event.chat_id,
+                    msg_id=event.message.id,
+                    reaction=[ReactionEmoji(emoticon=safe_emoji)],
+                ))
+                logger.info(f"[{name}] ✅ Fallback reacted {safe_emoji} | chat={event.chat_id}")
+            else:
+                raise reaction_err
 
     except Exception as e:
         logger.error(f"[{name}] ❌ Failed: {e}")
