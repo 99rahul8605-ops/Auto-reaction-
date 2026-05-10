@@ -59,13 +59,22 @@ def owner_only(func):
 # ─── Core reaction logic ──────────────────────────────────────────
 SAFE_REACTIONS = ["👍", "❤", "🔥", "🎉", "😂"]
 
-# Per-chat allowed reactions cache
+# Per-chat allowed reactions cache — (reactions_list, timestamp)
 _reaction_cache: dict = {}
+CACHE_TTL = 1800  # 30 min baad fresh fetch karo
 
 
 async def get_allowed_reactions(worker_client, chat, chat_id):
+    import time
+    now = time.time()
+
+    # Cache valid hai to return karo, expire ho gaya to fresh fetch karo
     if chat_id in _reaction_cache:
-        return _reaction_cache[chat_id]
+        cached_reactions, cached_at = _reaction_cache[chat_id]
+        if now - cached_at < CACHE_TTL:
+            return cached_reactions
+        # Expired — delete karo, fresh fetch hoga
+        del _reaction_cache[chat_id]
 
     allowed = []
     try:
@@ -99,7 +108,8 @@ async def get_allowed_reactions(worker_client, chat, chat_id):
         logger.debug(f"Could not fetch reactions for {chat_id}: {e}")
         allowed = SAFE_REACTIONS
 
-    _reaction_cache[chat_id] = allowed
+    import time
+    _reaction_cache[chat_id] = (allowed, time.time())
     return allowed
 
 
@@ -141,7 +151,12 @@ async def do_react(worker_client, event, name, token=""):
         )
 
     except Exception as e:
-        logger.error(f"[{name}] Failed: {e}")
+        # Invalid reaction error — cache clear karo, next msg pe fresh fetch hoga
+        if "Invalid reaction" in str(e):
+            _reaction_cache.pop(event.chat_id, None)
+            logger.info(f"[{name}] Cache cleared for chat={event.chat_id} (reaction changed)")
+        else:
+            logger.error(f"[{name}] Failed: {e}")
 
 # ─── Worker Bot ──────────────────────────────────────────────────
 async def start_worker(token: str, username: str, name: str):
