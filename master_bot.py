@@ -177,18 +177,20 @@ async def start_worker(token: str, username: str, name: str):
             Button.url("📣 Support Channel", "https://t.me/Bot_support_channell"),
         ])
 
-        image_url = "https://ibb.co/qQNn0YX"
+        # IMAGE_FILE_ID = apne kisi worker bot pe image bhejo,
+        # /getfileid command se ID lo, phir niche set karo
+        IMAGE_FILE_ID = os.environ.get("WELCOME_IMAGE_ID", None)
         try:
-            async with worker_client.action(event.chat_id, "typing"):
-                pass
-            await worker_client.send_file(
-                event.chat_id,
-                file=image_url,
-                caption=caption,
-                buttons=buttons,
-            )
+            if IMAGE_FILE_ID:
+                await worker_client.send_file(
+                    event.chat_id,
+                    file=IMAGE_FILE_ID,
+                    caption=caption,
+                    buttons=buttons,
+                )
+            else:
+                await event.respond(caption, buttons=buttons)
         except Exception:
-            # Image load na ho to sirf text bhejo
             await event.respond(caption, buttons=buttons)
 
     @worker_client.on(events.NewMessage())
