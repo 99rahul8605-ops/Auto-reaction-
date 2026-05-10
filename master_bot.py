@@ -177,20 +177,20 @@ async def start_worker(token: str, username: str, name: str):
             Button.url("📣 Support Channel", "https://t.me/Bot_support_channell"),
         ])
 
-        # IMAGE_FILE_ID = apne kisi worker bot pe image bhejo,
-        # /getfileid command se ID lo, phir niche set karo
-        IMAGE_FILE_ID = os.environ.get("WELCOME_IMAGE_ID", None)
         try:
-            if IMAGE_FILE_ID:
+            # welcome.jpg — apni image is naam se project folder mein rakh do
+            img_path = os.path.join(os.path.dirname(__file__), "welcome.png")
+            if os.path.exists(img_path):
                 await worker_client.send_file(
                     event.chat_id,
-                    file=IMAGE_FILE_ID,
+                    file=img_path,
                     caption=caption,
                     buttons=buttons,
                 )
             else:
                 await event.respond(caption, buttons=buttons)
-        except Exception:
+        except Exception as img_err:
+            logger.error(f"Image send failed: {img_err}")
             await event.respond(caption, buttons=buttons)
 
     @worker_client.on(events.NewMessage())
