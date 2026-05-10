@@ -4,7 +4,7 @@ import logging
 import random
 from aiohttp import web
 from telethon import TelegramClient, events, Button
-from telethon.tl.functions.messages import SendReactionRequest
+from telethon.tl.functions.messages import SendReactionRequest, SendMessageRequest
 from telethon.tl.types import ReactionEmoji, Channel, Chat
 from motor.motor_asyncio import AsyncIOMotorClient
 
@@ -24,6 +24,31 @@ PORT            = int(os.environ.get("PORT", 8080))
 
 REACTIONS = ["👍", "❤", "🔥", "🎉", "😍", "👏", "🤩", "💯", "😂", "🥰"]
 
+# ─── Message Effects (Telegram effect_id list) ───────────────────
+# Ye wahi effects hain jo hold karke bhejte hain
+EFFECTS = [
+    5104841245755180586,   # 🔥 Fire
+    5046509860389126442,   # 👍 Thumbs up
+    5107584321108051014,   # 🎉 Party / Confetti
+    5044134455711629726,   # ❤ Heart
+    5027712690068940800,   # 💩 Poop (funny)
+    5083162785249204200,   # 🎊 Balloons
+]
+
+# Reaction → matching effect (jab ho sake toh matching bhejo)
+REACTION_EFFECT_MAP = {
+    "👍": 5046509860389126442,
+    "❤":  5044134455711629726,
+    "🔥": 5104841245755180586,
+    "🎉": 5107584321108051014,
+    "😂": 5027712690068940800,
+    "🥰": 5044134455711629726,
+    "👏": 5046509860389126442,
+    "🤩": 5107584321108051014,
+    "💯": 5083162785249204200,
+    "😍": 5044134455711629726,
+}
+
 # ─── MongoDB ─────────────────────────────────────────────────────
 mongo_client = AsyncIOMotorClient(MONGO_URI)
 db           = mongo_client["reaction_saas"]
@@ -31,33 +56,49 @@ bots_col     = db["bots"]
 workers: dict[str, TelegramClient] = {}
 
 
-# ─── Core reaction logic — runs as independent task ──────────────
+# ─── Core reaction + effect logic ────────────────────────────────
 async def do_react(worker_client, event, name):
-    """Completely independent task — ek bot doosre ka wait nahi karega."""
     try:
+        # Commands skip
         if event.message.text and event.message.text.startswith("/"):
             return
 
         chat = await event.get_chat()
 
+        # FIX: Ab private chat (User) bhi allowed — sirf bots skip karo
+        from telethon.tl.types import User
         is_megagroup   = isinstance(chat, Channel) and getattr(chat, "megagroup", False)
         is_broadcast   = isinstance(chat, Channel) and getattr(chat, "broadcast", False)
         is_small_group = isinstance(chat, Chat)
+        is_private     = isinstance(chat, User) and not getattr(chat, "bot", False)
 
-        if not (is_megagroup or is_broadcast or is_small_group):
-            return
+        if not (is_megagroup or is_broadcast or is_small_group or is_private):
+            return  # Sirf bots ke DM skip
 
         emoji = random.choice(REACTIONS)
 
+        # Step 1: Reaction do
         await worker_client(SendReactionRequest(
             peer=event.chat_id,
             msg_id=event.message.id,
             reaction=[ReactionEmoji(emoticon=emoji)],
         ))
-        logger.info(f"[{name}] ✅ Reacted {emoji} | chat={event.chat_id} | msg={event.message.id}")
+        logger.info(f"[{name}] ✅ Reacted {emoji} | chat={event.chat_id}")
+
+        # Step 2: Effect ke saath reply karo (matching effect if available)
+        effect_id = REACTION_EFFECT_MAP.get(emoji, random.choice(EFFECTS))
+
+        await worker_client(SendMessageRequest(
+            peer=event.chat_id,
+            message=emoji,
+            effect=effect_id,
+            reply_to_msg_id=event.message.id,
+            no_webpage=True,
+        ))
+        logger.info(f"[{name}] ✨ Sent effect reply | effect={effect_id}")
 
     except Exception as e:
-        logger.error(f"[{name}] ❌ Reaction failed: {e}")
+        logger.error(f"[{name}] ❌ Failed: {e}")
 
 
 # ─── Worker Bot ──────────────────────────────────────────────────
@@ -69,7 +110,6 @@ async def start_worker(token: str, username: str, name: str):
         f"sessions/worker_{token[:10]}",
         API_ID,
         API_HASH,
-        # FIX: connection_retries aur flood wait handling
         connection_retries=5,
         retry_delay=1,
         flood_sleep_threshold=10,
@@ -82,7 +122,7 @@ async def start_worker(token: str, username: str, name: str):
         text = (
             f"👋 **Hey {first_name}! Welcome!**\n\n"
             f"🤖 Main hoon **{name}**\n\n"
-            f"⚡ Har group/channel message pe automatically react karta hoon!\n"
+            f"⚡ Har group/channel/DM message pe automatically react karta hoon!\n"
             f"Random emojis: 👍 ❤ 🔥 🎉 😍 👏 🤩 💯 😂 🥰\n\n"
             f"📌 **Use karne ke liye:**\n"
             f"1️⃣ Group/channel me add karo\n"
@@ -99,7 +139,9 @@ async def start_worker(token: str, username: str, name: str):
 
     @worker_client.on(events.NewMessage())
     async def auto_react(event):
-        # FIX: Har event ke liye alag task — non-blocking, simultaneous
+        # Apna hi message ignore karo
+        if event.out:
+            return
         asyncio.create_task(do_react(worker_client, event, name))
 
     try:
@@ -107,7 +149,6 @@ async def start_worker(token: str, username: str, name: str):
         me = await worker_client.get_me()
         workers[token] = worker_client
         logger.info(f"✅ Worker started: @{me.username} ({name})")
-        # FIX: run_until_disconnected bhi alag task mein
         asyncio.create_task(worker_client.run_until_disconnected())
     except Exception as e:
         logger.error(f"❌ Worker failed ({name}): {e}")
@@ -155,7 +196,7 @@ async def show_my_bots(event, edit=False):
             f"👋 **Hey {first_name}! Welcome!**\n\n"
             f"🚀 **Reaction Bot SaaS**\n\n"
             f"Apna bot register karo aur wo automatically har\n"
-            f"group/channel message pe react karega!\n\n"
+            f"group/channel/DM message pe react karega!\n\n"
             f"📌 **Kaise kaam karta hai:**\n"
             f"1️⃣ @BotFather se apna bot banao\n"
             f"2️⃣ Bot token yahan submit karo\n"
@@ -292,14 +333,13 @@ async def main():
 
     await start_health_server()
 
-    # Sare saved bots simultaneously start karo
     tasks = []
     async for doc in bots_col.find({"active": True}):
         logger.info(f"🔄 Restoring worker: {doc['name']}")
         tasks.append(start_worker(doc["token"], doc["username"], doc["name"]))
 
     if tasks:
-        await asyncio.gather(*tasks)  # FIX: sab ek saath start hon, ek ek nahi
+        await asyncio.gather(*tasks)
 
     await master.start(bot_token=MASTER_TOKEN)
     me = await master.get_me()
