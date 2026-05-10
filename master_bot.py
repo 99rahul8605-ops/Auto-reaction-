@@ -47,9 +47,55 @@ def owner_only(func):
     return wrapper
 
 
+
+
+
 # ─── Core reaction logic ──────────────────────────────────────────
-# Ye 100% safe reactions hain — fallback ke liye
 SAFE_REACTIONS = ["👍", "❤", "🔥", "🎉", "😂"]
+
+# Per-chat allowed reactions cache
+_reaction_cache: dict = {}
+
+
+async def get_allowed_reactions(worker_client, chat, chat_id):
+    if chat_id in _reaction_cache:
+        return _reaction_cache[chat_id]
+
+    allowed = []
+    try:
+        from telethon.tl.functions.channels import GetFullChannelRequest
+        from telethon.tl.functions.messages import GetFullChatRequest
+        from telethon.tl.types import (
+            ChatReactionsAll, ChatReactionsSome, ChatReactionsNone,
+            ReactionEmoji as RE,
+        )
+
+        if isinstance(chat, Channel):
+            full      = await worker_client(GetFullChannelRequest(chat))
+            available = full.full_chat.available_reactions
+        elif isinstance(chat, Chat):
+            full      = await worker_client(GetFullChatRequest(chat.id))
+            available = full.full_chat.available_reactions
+        else:
+            _reaction_cache[chat_id] = REACTIONS
+            return REACTIONS
+
+        if isinstance(available, ChatReactionsAll):
+            allowed = REACTIONS
+        elif isinstance(available, ChatReactionsNone):
+            allowed = []
+        elif isinstance(available, ChatReactionsSome):
+            allowed = [r.emoticon for r in available.reactions if isinstance(r, RE)]
+        else:
+            allowed = SAFE_REACTIONS
+
+    except Exception as e:
+        logger.debug(f"Could not fetch reactions for {chat_id}: {e}")
+        allowed = SAFE_REACTIONS
+
+    _reaction_cache[chat_id] = allowed
+    return allowed
+
 
 async def do_react(worker_client, event, name):
     try:
@@ -66,32 +112,23 @@ async def do_react(worker_client, event, name):
         if not (is_megagroup or is_broadcast or is_small_group or is_private):
             return
 
-        emoji = random.choice(REACTIONS)
+        allowed = await get_allowed_reactions(worker_client, chat, event.chat_id)
 
-        try:
-            await worker_client(SendReactionRequest(
-                peer=event.chat_id,
-                msg_id=event.message.id,
-                reaction=[ReactionEmoji(emoticon=emoji)],
-            ))
-            logger.info(f"[{name}] ✅ Reacted {emoji} | chat={event.chat_id}")
+        if not allowed:
+            logger.debug(f"[{name}] Reactions disabled | chat={event.chat_id}")
+            return
 
-        except Exception as reaction_err:
-            if "Invalid reaction" in str(reaction_err):
-                # Fallback — safe emoji se try karo
-                safe_emoji = random.choice(SAFE_REACTIONS)
-                await worker_client(SendReactionRequest(
-                    peer=event.chat_id,
-                    msg_id=event.message.id,
-                    reaction=[ReactionEmoji(emoticon=safe_emoji)],
-                ))
-                logger.info(f"[{name}] ✅ Fallback reacted {safe_emoji} | chat={event.chat_id}")
-            else:
-                raise reaction_err
+        emoji = random.choice(allowed)
+
+        await worker_client(SendReactionRequest(
+            peer=event.chat_id,
+            msg_id=event.message.id,
+            reaction=[ReactionEmoji(emoticon=emoji)],
+        ))
+        logger.info(f"[{name}] Reacted {emoji} | chat={event.chat_id}")
 
     except Exception as e:
-        logger.error(f"[{name}] ❌ Failed: {e}")
-
+        logger.error(f"[{name}] Failed: {e}")
 
 # ─── Worker Bot ──────────────────────────────────────────────────
 async def start_worker(token: str, username: str, name: str):
