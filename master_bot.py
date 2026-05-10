@@ -22,13 +22,13 @@ MASTER_USERNAME = os.environ.get("MASTER_BOT_USERNAME", "")
 MONGO_URI       = os.environ["MONGO_URI"]
 PORT            = int(os.environ.get("PORT", 8080))
 
-REACTIONS = ["👍", "❤️", "🔥", "🎉", "😍", "👏", "🤩", "💯", "😂", "🥰"]
+REACTIONS = ["👍", "❤", "🔥", "🎉", "😍", "👏", "🤩", "💯", "😂", "🥰"]
 
 # ─── MongoDB ─────────────────────────────────────────────────────
 mongo_client = AsyncIOMotorClient(MONGO_URI)
 db           = mongo_client["reaction_saas"]
 bots_col     = db["bots"]
-workers: dict[str, TelegramClient] = {}  # token → running client
+workers: dict[str, TelegramClient] = {}
 
 
 # ─── Worker Bot ──────────────────────────────────────────────────
@@ -36,9 +36,10 @@ async def start_worker(token: str, username: str, name: str):
     if token in workers:
         return
 
-    client = TelegramClient(f"sessions/worker_{token[:10]}", API_ID, API_HASH)
+    # FIX: worker_client naam diya — closure mein global 'master' se clash nahi hoga
+    worker_client = TelegramClient(f"sessions/worker_{token[:10]}", API_ID, API_HASH)
 
-    @client.on(events.NewMessage(pattern=r"^/start$"))
+    @worker_client.on(events.NewMessage(pattern=r"^/start$"))
     async def start_cmd(event):
         sender     = await event.get_sender()
         first_name = getattr(sender, "first_name", "there") or "there"
@@ -46,7 +47,7 @@ async def start_worker(token: str, username: str, name: str):
             f"👋 **Hey {first_name}! Welcome!**\n\n"
             f"🤖 Main hoon **{name}**\n\n"
             f"⚡ Har group/channel message pe automatically react karta hoon!\n"
-            f"Random emojis: 👍 ❤️ 🔥 🎉 😍 👏 🤩 💯 😂 🥰\n\n"
+            f"Random emojis: 👍 ❤ 🔥 🎉 😍 👏 🤩 💯 😂 🥰\n\n"
             f"📌 **Use karne ke liye:**\n"
             f"1️⃣ Group/channel me add karo\n"
             f"2️⃣ Admin banao\n"
@@ -60,47 +61,50 @@ async def start_worker(token: str, username: str, name: str):
             ]]
         await event.respond(text, buttons=buttons)
 
-    @client.on(events.NewMessage())
+    @worker_client.on(events.NewMessage())
     async def auto_react(event):
         if event.message.text and event.message.text.startswith("/"):
             return
         try:
             chat = await event.get_chat()
 
-            # FIX: Proper Telethon type checks
-            is_megagroup = isinstance(chat, Channel) and getattr(chat, "megagroup", False)
-            is_broadcast = isinstance(chat, Channel) and getattr(chat, "broadcast", False)
+            # Proper type check
+            is_megagroup   = isinstance(chat, Channel) and getattr(chat, "megagroup", False)
+            is_broadcast   = isinstance(chat, Channel) and getattr(chat, "broadcast", False)
             is_small_group = isinstance(chat, Chat)
 
             if not (is_megagroup or is_broadcast or is_small_group):
                 return
 
             emoji = random.choice(REACTIONS)
-            await client(SendReactionRequest(
+
+            # FIX: worker_client use ho raha hai — master client nahi
+            await worker_client(SendReactionRequest(
                 peer=event.chat_id,
                 msg_id=event.message.id,
                 reaction=[ReactionEmoji(emoticon=emoji)],
             ))
             logger.info(f"[{name}] Reacted {emoji} | chat={event.chat_id}")
+
         except Exception as e:
-            logger.debug(f"[{name}] Skip: {e}")
+            logger.error(f"[{name}] Reaction failed: {e}")
 
     try:
-        await client.start(bot_token=token)
-        me = await client.get_me()
-        workers[token] = client
+        await worker_client.start(bot_token=token)
+        me = await worker_client.get_me()
+        workers[token] = worker_client
         logger.info(f"✅ Worker started: @{me.username} ({name})")
-        asyncio.create_task(client.run_until_disconnected())
+        asyncio.create_task(worker_client.run_until_disconnected())
     except Exception as e:
         logger.error(f"❌ Worker failed ({name}): {e}")
-        await client.disconnect()
+        await worker_client.disconnect()
 
 
 async def stop_worker(token: str):
-    client = workers.pop(token, None)
-    if client:
-        await client.disconnect()
-        logger.info(f"🛑 Worker stopped for token ...{token[:10]}")
+    worker_client = workers.pop(token, None)
+    if worker_client:
+        await worker_client.disconnect()
+        logger.info(f"🛑 Worker stopped: ...{token[:10]}")
 
 
 # ─── Master Bot ──────────────────────────────────────────────────
@@ -109,13 +113,11 @@ master = TelegramClient("sessions/master", API_ID, API_HASH)
 waiting_for_token: set[int] = set()
 
 
-# ─── Helper: Show user's bot list ────────────────────────────────
 async def show_my_bots(event, edit=False):
     sender_id  = event.sender_id
     sender     = await event.get_sender()
     first_name = getattr(sender, "first_name", "there") or "there"
 
-    # FIX: Fetch ALL bots for this user, not just one
     user_bots = await bots_col.find({"owner_id": sender_id}).to_list(length=50)
 
     if user_bots:
@@ -126,15 +128,11 @@ async def show_my_bots(event, edit=False):
         lines.append("\n⬇️ Manage karo ya naya bot add karo:")
         text = "\n".join(lines)
 
-        # Buttons: one remove button per bot + add new
         bot_buttons = []
         for doc in user_bots:
             short = doc["username"] or doc["name"]
             bot_buttons.append([
-                Button.inline(
-                    f"🗑 Remove @{short}",
-                    data=f"remove_{doc['token'][:20]}"
-                )
+                Button.inline(f"🗑 Remove @{short}", data=f"remove_{doc['token'][:20]}")
             ])
         bot_buttons.append([Button.inline("➕ Naya Bot Add Karo", data="register")])
         buttons = bot_buttons
@@ -164,7 +162,6 @@ async def master_start(event):
     await show_my_bots(event)
 
 
-# ─── Register flow ───────────────────────────────────────────────
 @master.on(events.CallbackQuery(data="register"))
 async def ask_for_token(event):
     waiting_for_token.add(event.sender_id)
@@ -196,7 +193,6 @@ async def handle_token_input(event):
         await event.respond("❌ Token format galat hai. Dobara try karo /start se.")
         return
 
-    # FIX: Check token globally (not per user) — same token dobara na chale
     existing = await bots_col.find_one({"token": token})
     if existing:
         await event.respond("⚠️ Ye token already registered hai!")
@@ -237,12 +233,10 @@ async def handle_token_input(event):
     )
 
 
-# ─── Remove bot by token prefix ──────────────────────────────────
 @master.on(events.CallbackQuery(pattern=rb"^remove_(.+)$"))
 async def remove_bot(event):
     token_prefix = event.data.decode().split("_", 1)[1]
 
-    # FIX: Find by token prefix, verify ownership
     doc = await bots_col.find_one({
         "token":    {"$regex": f"^{token_prefix}"},
         "owner_id": event.sender_id,
@@ -254,14 +248,10 @@ async def remove_bot(event):
 
     await stop_worker(doc["token"])
     await bots_col.delete_one({"_id": doc["_id"]})
-
     await event.answer(f"🗑 @{doc['username']} remove ho gaya!", alert=True)
-
-    # Refresh the list
     await show_my_bots(event, edit=True)
 
 
-# ─── /mybots command ─────────────────────────────────────────────
 @master.on(events.NewMessage(pattern=r"^/mybots$"))
 async def my_bots_cmd(event):
     await show_my_bots(event)
