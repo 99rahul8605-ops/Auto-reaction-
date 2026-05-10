@@ -298,63 +298,132 @@ async def cancel_registration(event):
     await event.respond("❌ Registration cancel ho gaya.")
 
 
+# ─── Unified message input handler ──────────────────────────────
 @master.on(events.NewMessage())
-async def handle_token_input(event):
-    global waiting_for_token
+async def handle_message_input(event):
+    global waiting_for_token, waiting_for_broadcast
+
+    # Non-owner — block karo
     if event.sender_id != OWNER_ID:
         await event.respond("🚫 **Ye bot sirf owner ke liye hai!**")
         return
-    if not waiting_for_token:
-        return
-    if waiting_for_broadcast:  # broadcast mode me token input ignore karo
-        return
-    if not event.message.text or event.message.text.startswith("/"):
+
+    # Commands is handler mein process nahi honge
+    if event.message.text and event.message.text.startswith("/"):
         return
 
-    token = event.message.text.strip()
-    waiting_for_token = False
+    # ── Token input mode ─────────────────────────────────────────
+    if waiting_for_token:
+        if not event.message.text:
+            return
+        token = event.message.text.strip()
+        waiting_for_token = False
 
-    if ":" not in token or len(token) < 30:
-        await event.respond("❌ Token format galat hai. Dobara try karo /start se.")
+        if ":" not in token or len(token) < 30:
+            await event.respond("❌ Token format galat hai. Dobara try karo /start se.")
+            return
+
+        existing = await bots_col.find_one({"token": token})
+        if existing:
+            await event.respond("⚠️ Ye token already registered hai!")
+            return
+
+        await event.respond("⏳ Token verify ho raha hai...")
+
+        try:
+            test_client = TelegramClient(f"sessions/test_{token[:10]}", API_ID, API_HASH)
+            await test_client.start(bot_token=token)
+            me           = await test_client.get_me()
+            bot_username = me.username or ""
+            bot_name     = me.first_name or "My Bot"
+            await test_client.disconnect()
+        except Exception as e:
+            await event.respond(f"❌ Token invalid hai ya bot start nahi hua.\n\nError: `{e}`")
+            return
+
+        await bots_col.insert_one({
+            "owner_id": OWNER_ID,
+            "token":    token,
+            "username": bot_username,
+            "name":     bot_name,
+            "active":   True,
+        })
+
+        await start_worker(token, bot_username, bot_name)
+
+        await event.respond(
+            f"✅ **Bot successfully registered!**\n\n"
+            f"🤖 **{bot_name}** (@{bot_username})\n\n"
+            f"Ab apne bot ko group/channel me add karo aur admin banao!\n\n"
+            f"Bot automatically react karna shuru kar dega 🎉",
+            buttons=[[
+                Button.url(f"➕ @{bot_username} ko Add Karo", f"https://t.me/{bot_username}?startgroup=true"),
+            ]] if bot_username else None
+        )
         return
 
-    existing = await bots_col.find_one({"token": token})
-    if existing:
-        await event.respond("⚠️ Ye token already registered hai!")
+    # ── Broadcast input mode ──────────────────────────────────────
+    if waiting_for_broadcast:
+        waiting_for_broadcast = False
+
+        all_bots = await bots_col.find({"active": True}).to_list(length=500)
+        if not all_bots:
+            await event.respond("⚠️ Koi bot registered nahi hai.")
+            return
+
+        status_msg = await event.respond("⏳ Broadcast shuru ho raha hai...")
+
+        total_sent    = 0
+        total_failed  = 0
+        total_blocked = 0
+
+        msg       = event.message
+        has_media = msg.media is not None
+
+        for bot_doc in all_bots:
+            token        = bot_doc["token"]
+            worker_client = workers.get(token)
+            if not worker_client:
+                continue
+
+            bot_users = await users_col.find({"bot_token": token}).to_list(length=10000)
+            if not bot_users:
+                logger.info(f"No users for bot {bot_doc['name']}")
+                continue
+
+            for user_doc in bot_users:
+                try:
+                    if has_media:
+                        await worker_client.send_file(
+                            entity=user_doc["user_id"],
+                            file=msg.media,
+                            caption=msg.message or "",
+                        )
+                    else:
+                        await worker_client.send_message(
+                            entity=user_doc["user_id"],
+                            message=msg.message or "",
+                        )
+                    total_sent += 1
+                except Exception as e:
+                    err = str(e).lower()
+                    if any(x in err for x in ["blocked", "deactivated", "forbidden", "privacy", "user not found"]):
+                        total_blocked += 1
+                        await users_col.delete_one({"_id": user_doc["_id"]})
+                    else:
+                        total_failed += 1
+                        logger.error(f"Broadcast failed uid={user_doc['user_id']}: {e}")
+
+                await asyncio.sleep(0.05)
+
+        await status_msg.edit(
+            f"✅ **Broadcast Complete!**\n\n"
+            f"📤 Sent: {total_sent}\n"
+            f"🚫 Blocked/Removed: {total_blocked}\n"
+            f"❌ Failed: {total_failed}"
+        )
         return
 
-    await event.respond("⏳ Token verify ho raha hai...")
-
-    try:
-        test_client = TelegramClient(f"sessions/test_{token[:10]}", API_ID, API_HASH)
-        await test_client.start(bot_token=token)
-        me           = await test_client.get_me()
-        bot_username = me.username or ""
-        bot_name     = me.first_name or "My Bot"
-        await test_client.disconnect()
-    except Exception as e:
-        await event.respond(f"❌ Token invalid hai ya bot start nahi hua.\n\nError: `{e}`")
-        return
-
-    await bots_col.insert_one({
-        "owner_id": OWNER_ID,
-        "token":    token,
-        "username": bot_username,
-        "name":     bot_name,
-        "active":   True,
-    })
-
-    await start_worker(token, bot_username, bot_name)
-
-    await event.respond(
-        f"✅ **Bot successfully registered!**\n\n"
-        f"🤖 **{bot_name}** (@{bot_username})\n\n"
-        f"Ab apne bot ko group/channel me add karo aur admin banao!\n\n"
-        f"Bot automatically react karna shuru kar dega 🎉",
-        buttons=[[
-            Button.url(f"➕ @{bot_username} ko Add Karo", f"https://t.me/{bot_username}?startgroup=true"),
-        ]] if bot_username else None
-    )
 
 
 @master.on(events.CallbackQuery(pattern=rb"^remove_(.+)$"))
@@ -394,70 +463,6 @@ async def broadcast_cmd(event):
     )
 
 
-@master.on(events.NewMessage())
-async def handle_broadcast_input(event):
-    global waiting_for_broadcast
-    if event.sender_id != OWNER_ID:
-        return
-    if not waiting_for_broadcast:
-        return
-    if waiting_for_token:  # token input mode me broadcast ignore karo
-        return
-    if event.message.text and event.message.text.startswith("/"):
-        return
-
-    waiting_for_broadcast = False
-
-    # Saare active bots fetch karo
-    all_bots = await bots_col.find({"active": True}).to_list(length=500)
-    if not all_bots:
-        await event.respond("⚠️ Koi bot registered nahi hai.")
-        return
-
-    status_msg = await event.respond("⏳ Broadcast shuru ho raha hai...")
-
-    total_sent    = 0
-    total_failed  = 0
-    total_blocked = 0
-
-    for bot_doc in all_bots:
-        token = bot_doc["token"]
-        worker_client = workers.get(token)
-        if not worker_client:
-            continue
-
-        # Us bot ke saare users fetch karo
-        bot_users = await users_col.find({"bot_token": token}).to_list(length=10000)
-        if not bot_users:
-            continue
-
-        for user_doc in bot_users:
-            try:
-                await worker_client.forward_messages(
-                    entity=user_doc["user_id"],
-                    messages=event.message.id,
-                    from_peer=event.chat_id,
-                )
-                total_sent += 1
-            except Exception as e:
-                err = str(e).lower()
-                if "blocked" in err or "user is deactivated" in err or "forbidden" in err:
-                    total_blocked += 1
-                    # Block kiya hua user remove karo DB se
-                    await users_col.delete_one({"_id": user_doc["_id"]})
-                else:
-                    total_failed += 1
-                    logger.debug(f"Broadcast failed for {user_doc['user_id']}: {e}")
-
-            # Flood avoid karne ke liye thoda wait
-            await asyncio.sleep(0.05)
-
-    await status_msg.edit(
-        f"✅ **Broadcast Complete!**\n\n"
-        f"📤 Sent: {total_sent}\n"
-        f"🚫 Blocked/Removed: {total_blocked}\n"
-        f"❌ Failed: {total_failed}"
-    )
 
 
 # ─── Health Server ───────────────────────────────────────────────
