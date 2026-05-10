@@ -34,7 +34,9 @@ mongo_client = AsyncIOMotorClient(MONGO_URI)
 db           = mongo_client["reaction_saas"]
 bots_col     = db["bots"]
 users_col    = db["users"]   # har bot ke users track karne ke liye
+stats_col    = db["stats"]    # reaction count track karne ke liye
 workers: dict[str, TelegramClient] = {}
+worker_start_times: dict[str, float] = {}  # token → start timestamp
 
 # broadcast state
 waiting_for_broadcast: bool = False
@@ -101,7 +103,7 @@ async def get_allowed_reactions(worker_client, chat, chat_id):
     return allowed
 
 
-async def do_react(worker_client, event, name):
+async def do_react(worker_client, event, name, token=""):
     try:
         if event.message.text and event.message.text.startswith("/"):
             return
@@ -130,6 +132,13 @@ async def do_react(worker_client, event, name):
             reaction=[ReactionEmoji(emoticon=emoji)],
         ))
         logger.info(f"[{name}] Reacted {emoji} | chat={event.chat_id}")
+
+        # Stats update karo
+        await stats_col.update_one(
+            {"token": token},
+            {"$inc": {"reaction_count": 1}},
+            upsert=True,
+        )
 
     except Exception as e:
         logger.error(f"[{name}] Failed: {e}")
@@ -197,14 +206,46 @@ async def start_worker(token: str, username: str, name: str):
     async def auto_react(event):
         if event.out:
             return
-        asyncio.create_task(do_react(worker_client, event, name))
+        asyncio.create_task(do_react(worker_client, event, name, token))
 
     try:
         await worker_client.start(bot_token=token)
         me = await worker_client.get_me()
         workers[token] = worker_client
+        import time
+        worker_start_times[token] = time.time()
         logger.info(f"✅ Worker started: @{me.username} ({name})")
-        asyncio.create_task(worker_client.run_until_disconnected())
+
+        async def run_with_autorestart():
+            """Worker crash ho to auto restart karo."""
+            retry = 0
+            while True:
+                try:
+                    await worker_client.run_until_disconnected()
+                except Exception as run_err:
+                    logger.error(f"[{name}] Disconnected: {run_err}")
+
+                # Agar manually stop kiya gaya ho toh restart mat karo
+                if token not in workers:
+                    logger.info(f"[{name}] Manually stopped — not restarting")
+                    break
+
+                retry += 1
+                wait = min(5 * retry, 60)  # 5s, 10s, 15s... max 60s
+                logger.info(f"[{name}] Restarting in {wait}s (attempt #{retry})...")
+                await asyncio.sleep(wait)
+
+                try:
+                    await worker_client.connect()
+                    if not await worker_client.is_user_authorized():
+                        await worker_client.start(bot_token=token)
+                    worker_start_times[token] = time.time()
+                    logger.info(f"[{name}] ✅ Restarted successfully")
+                    retry = 0  # Reset retry count on success
+                except Exception as restart_err:
+                    logger.error(f"[{name}] Restart failed: {restart_err}")
+
+        asyncio.create_task(run_with_autorestart())
     except Exception as e:
         logger.error(f"❌ Worker failed ({name}): {e}")
         await worker_client.disconnect()
@@ -464,6 +505,58 @@ async def broadcast_cmd(event):
 
 
 
+
+
+@master.on(events.NewMessage(pattern=r"^/stats$"))
+@owner_only
+async def stats_cmd(event):
+    import time
+
+    all_bots  = await bots_col.find({"owner_id": OWNER_ID}).to_list(length=500)
+    total_users = await users_col.count_documents({})
+
+    total_reactions = 0
+    lines = []
+
+    for doc in all_bots:
+        token     = doc["token"]
+        is_active = token in workers
+        status    = "🟢" if is_active else "🔴"
+
+        # Us bot ke users
+        bot_user_count = await users_col.count_documents({"bot_token": token})
+
+        # Us bot ke reactions
+        stat_doc = await stats_col.find_one({"token": token})
+        reactions = stat_doc["reaction_count"] if stat_doc else 0
+        total_reactions += reactions
+
+        # Uptime
+        uptime_str = "—"
+        if is_active and token in worker_start_times:
+            uptime_sec = int(time.time() - worker_start_times[token])
+            h, m = divmod(uptime_sec // 60, 60)
+            uptime_str = f"{h}h {m}m"
+
+        lines.append(
+            f"{status} **{doc['name']}**\n"
+            f"   👥 Users: {bot_user_count} | ⚡ Reactions: {reactions} | ⏱ Uptime: {uptime_str}"
+        )
+
+    text = (
+        f"📊 **Bot Stats**\n"
+        f"{'━' * 28}\n"
+        f"🤖 Total Bots: {len(all_bots)} ({len(workers)} active)\n"
+        f"👥 Total Users: {total_users}\n"
+        f"⚡ Total Reactions: {total_reactions}\n"
+        f"{'━' * 28}\n\n"
+    )
+    if lines:
+        text += "\n\n".join(lines)
+    else:
+        text += "Koi bot registered nahi hai."
+
+    await event.respond(text)
 
 # ─── Health Server ───────────────────────────────────────────────
 async def health_handler(req):
