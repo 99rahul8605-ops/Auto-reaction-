@@ -21,7 +21,8 @@ BOT_TOKEN = os.environ["BOT_TOKEN"]
 PORT      = int(os.environ.get("PORT", 8080))
 
 # ─── Reactions Pool ──────────────────────────────────────────────
-REACTIONS = ["👍", "❤️", "🔥", "🎉", "😍", "👏", "🤩", "💯", "😂", "🥰"]
+# "❤️" nahi — Telethon me sirf "❤" chahiye (variation selector remove)
+REACTIONS = ["👍", "❤", "🔥", "🎉", "😍", "👏", "🤩", "💯", "😂", "🥰"]
 
 # ─── Telethon Client ─────────────────────────────────────────────
 client = TelegramClient("bot_session", API_ID, API_HASH)
@@ -30,21 +31,21 @@ client = TelegramClient("bot_session", API_ID, API_HASH)
 # ─── Auto Reaction Handler ───────────────────────────────────────
 @client.on(events.NewMessage())
 async def auto_react(event):
-    """React to every new message in groups and channels."""
     try:
-        # Skip commands
+        # Commands skip karo
         if event.message.text and event.message.text.startswith("/"):
             return
 
         chat = await event.get_chat()
 
-        # FIX: Use proper Telethon type checks instead of __name__
-        is_megagroup = isinstance(chat, Channel) and getattr(chat, "megagroup", False)
-        is_broadcast = isinstance(chat, Channel) and getattr(chat, "broadcast", False)
+        # FIX: Telethon me "MegaGroup" type nahi hota — sab Channel hote hain
+        # megagroup=True ya broadcast=True check karo
+        is_megagroup   = isinstance(chat, Channel) and getattr(chat, "megagroup", False)
+        is_broadcast   = isinstance(chat, Channel) and getattr(chat, "broadcast", False)
         is_small_group = isinstance(chat, Chat)
 
         if not (is_megagroup or is_broadcast or is_small_group):
-            return  # Skip private chats / unknown
+            return  # Private chat — skip
 
         emoji = random.choice(REACTIONS)
 
@@ -54,12 +55,10 @@ async def auto_react(event):
             reaction=[ReactionEmoji(emoticon=emoji)],
         ))
 
-        logger.info(
-            f"Reacted {emoji} to msg {event.message.id} in chat {event.chat_id}"
-        )
+        logger.info(f"Reacted {emoji} | msg={event.message.id} | chat={event.chat_id}")
 
     except Exception as e:
-        logger.debug(f"Could not react: {e}")
+        logger.error(f"Reaction failed: {e}")  # debug → error, ab dikhega
 
 
 # ─── Health Check Server ──────────────────────────────────────────
@@ -71,7 +70,6 @@ async def start_health_server():
     app = web.Application()
     app.router.add_get("/", health_handler)
     app.router.add_get("/health", health_handler)
-
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", PORT)
