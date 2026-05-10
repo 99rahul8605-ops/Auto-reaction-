@@ -5,7 +5,7 @@ import random
 from aiohttp import web
 from telethon import TelegramClient, events
 from telethon.tl.functions.messages import SendReactionRequest
-from telethon.tl.types import ReactionEmoji
+from telethon.tl.types import ReactionEmoji, Channel, Chat
 
 # ─── Logging Setup ───────────────────────────────────────────────
 logging.basicConfig(
@@ -15,10 +15,10 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ─── Config from Environment ─────────────────────────────────────
-API_ID      = int(os.environ["API_ID"])
-API_HASH    = os.environ["API_HASH"]
-BOT_TOKEN   = os.environ["BOT_TOKEN"]
-PORT        = int(os.environ.get("PORT", 8080))
+API_ID    = int(os.environ["API_ID"])
+API_HASH  = os.environ["API_HASH"]
+BOT_TOKEN = os.environ["BOT_TOKEN"]
+PORT      = int(os.environ.get("PORT", 8080))
 
 # ─── Reactions Pool ──────────────────────────────────────────────
 REACTIONS = ["👍", "❤️", "🔥", "🎉", "😍", "👏", "🤩", "💯", "😂", "🥰"]
@@ -32,12 +32,19 @@ client = TelegramClient("bot_session", API_ID, API_HASH)
 async def auto_react(event):
     """React to every new message in groups and channels."""
     try:
-        chat = await event.get_chat()
-        chat_type = type(chat).__name__
-
-        # Only react in groups and channels, not private chats
-        if chat_type not in ("Channel", "Chat", "MegaGroup"):
+        # Skip commands
+        if event.message.text and event.message.text.startswith("/"):
             return
+
+        chat = await event.get_chat()
+
+        # FIX: Use proper Telethon type checks instead of __name__
+        is_megagroup = isinstance(chat, Channel) and getattr(chat, "megagroup", False)
+        is_broadcast = isinstance(chat, Channel) and getattr(chat, "broadcast", False)
+        is_small_group = isinstance(chat, Chat)
+
+        if not (is_megagroup or is_broadcast or is_small_group):
+            return  # Skip private chats / unknown
 
         emoji = random.choice(REACTIONS)
 
@@ -48,16 +55,14 @@ async def auto_react(event):
         ))
 
         logger.info(
-            f"Reacted {emoji} to msg {event.message.id} "
-            f"in chat {event.chat_id} ({chat_type})"
+            f"Reacted {emoji} to msg {event.message.id} in chat {event.chat_id}"
         )
 
     except Exception as e:
-        # Some messages/chats don't support reactions — silently skip
         logger.debug(f"Could not react: {e}")
 
 
-# ─── Health Check Server (for Render) ────────────────────────────
+# ─── Health Check Server ──────────────────────────────────────────
 async def health_handler(request):
     return web.Response(text="OK", status=200)
 
@@ -77,10 +82,8 @@ async def start_health_server():
 # ─── Main Entry Point ─────────────────────────────────────────────
 async def main():
     await start_health_server()
-
     await client.start(bot_token=BOT_TOKEN)
     logger.info("Bot started and listening for messages...")
-
     await client.run_until_disconnected()
 
 
