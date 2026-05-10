@@ -31,13 +31,49 @@ bots_col     = db["bots"]
 workers: dict[str, TelegramClient] = {}
 
 
+# ─── Core reaction logic — runs as independent task ──────────────
+async def do_react(worker_client, event, name):
+    """Completely independent task — ek bot doosre ka wait nahi karega."""
+    try:
+        if event.message.text and event.message.text.startswith("/"):
+            return
+
+        chat = await event.get_chat()
+
+        is_megagroup   = isinstance(chat, Channel) and getattr(chat, "megagroup", False)
+        is_broadcast   = isinstance(chat, Channel) and getattr(chat, "broadcast", False)
+        is_small_group = isinstance(chat, Chat)
+
+        if not (is_megagroup or is_broadcast or is_small_group):
+            return
+
+        emoji = random.choice(REACTIONS)
+
+        await worker_client(SendReactionRequest(
+            peer=event.chat_id,
+            msg_id=event.message.id,
+            reaction=[ReactionEmoji(emoticon=emoji)],
+        ))
+        logger.info(f"[{name}] ✅ Reacted {emoji} | chat={event.chat_id} | msg={event.message.id}")
+
+    except Exception as e:
+        logger.error(f"[{name}] ❌ Reaction failed: {e}")
+
+
 # ─── Worker Bot ──────────────────────────────────────────────────
 async def start_worker(token: str, username: str, name: str):
     if token in workers:
         return
 
-    # FIX: worker_client naam diya — closure mein global 'master' se clash nahi hoga
-    worker_client = TelegramClient(f"sessions/worker_{token[:10]}", API_ID, API_HASH)
+    worker_client = TelegramClient(
+        f"sessions/worker_{token[:10]}",
+        API_ID,
+        API_HASH,
+        # FIX: connection_retries aur flood wait handling
+        connection_retries=5,
+        retry_delay=1,
+        flood_sleep_threshold=10,
+    )
 
     @worker_client.on(events.NewMessage(pattern=r"^/start$"))
     async def start_cmd(event):
@@ -63,37 +99,15 @@ async def start_worker(token: str, username: str, name: str):
 
     @worker_client.on(events.NewMessage())
     async def auto_react(event):
-        if event.message.text and event.message.text.startswith("/"):
-            return
-        try:
-            chat = await event.get_chat()
-
-            # Proper type check
-            is_megagroup   = isinstance(chat, Channel) and getattr(chat, "megagroup", False)
-            is_broadcast   = isinstance(chat, Channel) and getattr(chat, "broadcast", False)
-            is_small_group = isinstance(chat, Chat)
-
-            if not (is_megagroup or is_broadcast or is_small_group):
-                return
-
-            emoji = random.choice(REACTIONS)
-
-            # FIX: worker_client use ho raha hai — master client nahi
-            await worker_client(SendReactionRequest(
-                peer=event.chat_id,
-                msg_id=event.message.id,
-                reaction=[ReactionEmoji(emoticon=emoji)],
-            ))
-            logger.info(f"[{name}] Reacted {emoji} | chat={event.chat_id}")
-
-        except Exception as e:
-            logger.error(f"[{name}] Reaction failed: {e}")
+        # FIX: Har event ke liye alag task — non-blocking, simultaneous
+        asyncio.create_task(do_react(worker_client, event, name))
 
     try:
         await worker_client.start(bot_token=token)
         me = await worker_client.get_me()
         workers[token] = worker_client
         logger.info(f"✅ Worker started: @{me.username} ({name})")
+        # FIX: run_until_disconnected bhi alag task mein
         asyncio.create_task(worker_client.run_until_disconnected())
     except Exception as e:
         logger.error(f"❌ Worker failed ({name}): {e}")
@@ -278,9 +292,14 @@ async def main():
 
     await start_health_server()
 
+    # Sare saved bots simultaneously start karo
+    tasks = []
     async for doc in bots_col.find({"active": True}):
         logger.info(f"🔄 Restoring worker: {doc['name']}")
-        await start_worker(doc["token"], doc["username"], doc["name"])
+        tasks.append(start_worker(doc["token"], doc["username"], doc["name"]))
+
+    if tasks:
+        await asyncio.gather(*tasks)  # FIX: sab ek saath start hon, ek ek nahi
 
     await master.start(bot_token=MASTER_TOKEN)
     me = await master.get_me()
